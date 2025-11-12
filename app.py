@@ -34,7 +34,7 @@ _chain = None
 def extract_text_from_pdfs(pdf_folder: str) -> List[Document]:
     docs: List[Document] = []
     if not os.path.isdir(pdf_folder):
-        print(f"⚠️ PDF 폴더가 없습니다: {pdf_folder}")
+        print(f"PDF 폴더가 없습니다: {pdf_folder}")
         return docs
 
     for file in os.listdir(pdf_folder):
@@ -54,7 +54,7 @@ def extract_text_from_pdfs(pdf_folder: str) -> List[Document]:
             except Exception as e:
                 print(f"Error loading {file}: {e}")
 
-    print(f"\n✅ 총 {len(docs)}개의 문서가 로드되었습니다.")
+    print(f"\n총 {len(docs)}개의 문서가 로드되었습니다.")
     return docs
 
 
@@ -71,7 +71,7 @@ def chunk_documents(docs, chunk_size=800, chunk_overlap=150):
 
 def build_vector_db(splits, persist_dir: str):
     if not OPENAI_API_KEY:
-        raise ValueError("❌ OPENAI_API_KEY가 .env에 설정되어 있지 않습니다.")
+        raise ValueError("OPENAI_API_KEY가 .env에 설정되어 있지 않습니다.")
 
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
@@ -84,7 +84,7 @@ def build_vector_db(splits, persist_dir: str):
         persist_directory=persist_dir
     )
     db.persist()
-    print(f"✅ Chroma 벡터DB 생성 완료 → {persist_dir}")
+    print(f"Chroma 벡터DB 생성 완료 → {persist_dir}")
     return db
 
 
@@ -95,7 +95,7 @@ def load_or_create_db(pdf_folder: str, persist_dir: str):
     global _db
     if os.path.isdir(persist_dir) and os.listdir(persist_dir):
         # 기존 DB 로드
-        print("📦 기존 Chroma DB 로드 중...")
+        print("기존 Chroma DB 로드 중...")
         embeddings = OpenAIEmbeddings(
             model="text-embedding-3-small",
             api_key=OPENAI_API_KEY
@@ -104,10 +104,10 @@ def load_or_create_db(pdf_folder: str, persist_dir: str):
             embedding_function=embeddings,
             persist_directory=persist_dir
         )
-        print("✅ 기존 DB 로드 완료")
+        print("기존 DB 로드 완료")
     else:
         # 새로 생성
-        print("🆕 DB가 없어 새로 생성합니다...")
+        print("DB가 없어 새로 생성합니다...")
         docs = extract_text_from_pdfs(pdf_folder)
         if not docs:
             raise RuntimeError("PDF에서 문서를 로드하지 못해 DB를 생성할 수 없습니다.")
@@ -161,12 +161,10 @@ def ask_once(chain, retriever, question: str):
 # =========================
 class AskRequest(BaseModel):
     question: str
-    k: Optional[int] = 3
 
 
 class AskResponse(BaseModel):
     answer: str
-    sources: List[str]
 
 
 class IngestRequest(BaseModel):
@@ -200,7 +198,7 @@ def on_startup():
     _db = load_or_create_db(PDF_FOLDER, PERSIST_DIR)
     _retriever = _db.as_retriever(search_kwargs={"k": 3})
     _chain = build_rag_chain(_retriever)
-    print("🚀 RAG 앱 준비 완료")
+    print("RAG 앱 준비 완료")
 
 
 @app.get("/health")
@@ -214,65 +212,7 @@ def ask(req: AskRequest):
     if _chain is None or _retriever is None:
         raise HTTPException(status_code=503, detail="RAG가 아직 초기화되지 않았습니다.")
     try:
-        # k가 바뀌면 요청마다 일시적으로 retriever k만 조정
-        if req.k and req.k > 0:
-            retriever = _db.as_retriever(search_kwargs={"k": req.k})
-        else:
-            retriever = _retriever
-
-        # 임시 체인(컨텍스트 경로만 retriever 교체)
-        temp_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | _chain.steps[1]  # prompt
-            | _chain.steps[2]  # llm
-            | _chain.steps[3]  # parser
-        )
-
-        answer, sources = ask_once(temp_chain, retriever, req.question)
+        answer, sources = ask_once(_chain, _retriever, req.question)
         return AskResponse(answer=answer, sources=sources)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest):
-    """
-    PDF를 다시 읽어 벡터DB를 재구축(갱신)합니다.
-    - 무거운 작업이니 필요할 때만 호출하세요.
-    """
-    global _db, _retriever, _chain
-
-    try:
-        folder = req.pdf_folder or PDF_FOLDER
-        docs = extract_text_from_pdfs(folder)
-        if not docs:
-            raise HTTPException(status_code=400, detail="PDF 폴더에서 문서를 찾지 못했습니다.")
-
-        splits = chunk_documents(docs, chunk_size=req.chunk_size, chunk_overlap=req.chunk_overlap)
-
-        # 기존 persist 디렉토리 초기화(선택: 여기서는 덮어쓰기)
-        if os.path.isdir(PERSIST_DIR):
-            # 안전하게 기존 임베딩 삭제를 원하면 아래처럼 폴더를 비우는 로직을 넣을 수 있음
-            # 단, 운영환경에선 주의!
-            for name in os.listdir(PERSIST_DIR):
-                path = os.path.join(PERSIST_DIR, name)
-                if os.path.isfile(path):
-                    os.remove(path)
-                else:
-                    # 하위 디렉토리 삭제
-                    import shutil
-                    shutil.rmtree(path)
-
-        _db = build_vector_db(splits, PERSIST_DIR)
-        _retriever = _db.as_retriever(search_kwargs={"k": 3})
-        _chain = build_rag_chain(_retriever)
-
-        return IngestResponse(
-            message="벡터DB 재구축 완료",
-            num_docs=len(docs),
-            num_chunks=len(splits),
-        )
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
